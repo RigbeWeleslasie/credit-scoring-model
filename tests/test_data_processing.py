@@ -210,3 +210,4 @@ class TestBuildFeaturePipeline:
         result = pipeline.fit_transform(df)
         assert "transaction_count" in result.columns
         assert "avg_transaction_amount" in result.columns
+
