@@ -15,6 +15,8 @@ from src.data_processing import (
     get_categorical_cols,
     get_numerical_cols,
     build_feature_pipeline,
+    compute_rfm,
+    assign_risk_labels,
 )
 
 
@@ -45,6 +47,20 @@ def make_sample_df():
     })
 
 
+def make_rfm_df():
+    """Create a minimal RFM DataFrame for clustering tests."""
+    return pd.DataFrame({
+        "CustomerId": ["C1", "C2", "C3", "C4", "C5", "C6"],
+        "Recency": [1, 2, 100, 150, 200, 3],
+        "Frequency": [50, 40, 2, 1, 1, 45],
+        "Monetary": [50000, 40000, 500, 200, 100, 48000],
+    })
+
+
+# ---------------------------------------------------------------------------
+# load_data tests
+# ---------------------------------------------------------------------------
+
 class TestLoadData:
     def test_returns_dataframe(self, tmp_path):
         sample = make_sample_df()
@@ -67,6 +83,10 @@ class TestLoadData:
         result = load_data(str(path))
         assert len(result) == len(sample)
 
+
+# ---------------------------------------------------------------------------
+# TemporalFeatureExtractor tests
+# ---------------------------------------------------------------------------
 
 class TestTemporalFeatureExtractor:
     def test_creates_temporal_columns(self):
@@ -95,6 +115,10 @@ class TestTemporalFeatureExtractor:
         assert result["txn_month"].between(1, 12).all()
 
 
+# ---------------------------------------------------------------------------
+# AggregateFeatureBuilder tests
+# ---------------------------------------------------------------------------
+
 class TestAggregateFeatureBuilder:
     def test_creates_aggregate_columns(self):
         df = make_sample_df()
@@ -119,6 +143,10 @@ class TestAggregateFeatureBuilder:
         assert result["std_transaction_amount"].isnull().sum() == 0
 
 
+# ---------------------------------------------------------------------------
+# DropIdentifierColumns tests
+# ---------------------------------------------------------------------------
+
 class TestDropIdentifierColumns:
     def test_drops_expected_columns(self):
         df = make_sample_df()
@@ -136,6 +164,10 @@ class TestDropIdentifierColumns:
             assert col in result.columns
 
 
+# ---------------------------------------------------------------------------
+# LogTransformer tests
+# ---------------------------------------------------------------------------
+
 class TestLogTransformer:
     def test_transforms_value_column(self):
         df = make_sample_df()
@@ -151,6 +183,10 @@ class TestLogTransformer:
         assert (result["Value"] >= 0).all()
 
 
+# ---------------------------------------------------------------------------
+# Column selector tests
+# ---------------------------------------------------------------------------
+
 class TestColumnSelectors:
     def test_get_categorical_cols(self):
         df = pd.DataFrame({"a": ["x", "y"], "b": [1, 2]})
@@ -160,6 +196,10 @@ class TestColumnSelectors:
         df = pd.DataFrame({"a": ["x", "y"], "b": [1, 2]})
         assert get_numerical_cols(df) == ["b"]
 
+
+# ---------------------------------------------------------------------------
+# Full pipeline smoke test
+# ---------------------------------------------------------------------------
 
 class TestBuildFeaturePipeline:
     def test_pipeline_runs_without_error(self):
@@ -181,3 +221,82 @@ class TestBuildFeaturePipeline:
         result = pipeline.fit_transform(df)
         assert "transaction_count" in result.columns
         assert "avg_transaction_amount" in result.columns
+
+
+# ---------------------------------------------------------------------------
+# compute_rfm tests
+# ---------------------------------------------------------------------------
+
+class TestComputeRFM:
+    def test_returns_dataframe(self):
+        df = make_sample_df()
+        result = compute_rfm(df)
+        assert isinstance(result, pd.DataFrame)
+
+    def test_has_rfm_columns(self):
+        df = make_sample_df()
+        result = compute_rfm(df)
+        for col in ["CustomerId", "Recency", "Frequency", "Monetary"]:
+            assert col in result.columns, f"Missing column: {col}"
+
+    def test_one_row_per_customer(self):
+        df = make_sample_df()
+        result = compute_rfm(df)
+        assert result["CustomerId"].nunique() == result.shape[0]
+
+    def test_recency_non_negative(self):
+        df = make_sample_df()
+        result = compute_rfm(df)
+        assert (result["Recency"] >= 0).all()
+
+    def test_frequency_positive(self):
+        df = make_sample_df()
+        result = compute_rfm(df)
+        assert (result["Frequency"] > 0).all()
+
+    def test_monetary_non_negative(self):
+        df = make_sample_df()
+        result = compute_rfm(df)
+        assert (result["Monetary"] >= 0).all()
+
+    def test_snapshot_date_respected(self):
+        df = make_sample_df()
+        result = compute_rfm(df, snapshot_date="2018-12-01")
+        assert result["Recency"].min() > 0
+
+
+# ---------------------------------------------------------------------------
+# assign_risk_labels tests
+# ---------------------------------------------------------------------------
+
+class TestAssignRiskLabels:
+    def test_adds_is_high_risk_column(self):
+        rfm = make_rfm_df()
+        result = assign_risk_labels(rfm, n_clusters=3, random_state=42)
+        assert "is_high_risk" in result.columns
+
+    def test_binary_labels(self):
+        rfm = make_rfm_df()
+        result = assign_risk_labels(rfm, n_clusters=3, random_state=42)
+        assert set(result["is_high_risk"].unique()).issubset({0, 1})
+
+    def test_adds_cluster_column(self):
+        rfm = make_rfm_df()
+        result = assign_risk_labels(rfm, n_clusters=3, random_state=42)
+        assert "cluster" in result.columns
+
+    def test_high_risk_customers_have_high_recency(self):
+        rfm = make_rfm_df()
+        result = assign_risk_labels(rfm, n_clusters=3, random_state=42)
+        high_risk_recency = result[result["is_high_risk"] == 1]["Recency"].mean()
+        low_risk_recency = result[result["is_high_risk"] == 0]["Recency"].mean()
+        assert high_risk_recency > low_risk_recency
+
+    def test_reproducible_with_same_seed(self):
+        rfm = make_rfm_df()
+        result1 = assign_risk_labels(rfm, n_clusters=3, random_state=42)
+        result2 = assign_risk_labels(rfm, n_clusters=3, random_state=42)
+        pd.testing.assert_series_equal(
+            result1["is_high_risk"].reset_index(drop=True),
+            result2["is_high_risk"].reset_index(drop=True),
+        )

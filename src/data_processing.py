@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
 
@@ -201,21 +202,174 @@ def build_preprocessing_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# RFM Computation (Task 4)
+# ---------------------------------------------------------------------------
+
+def compute_rfm(
+    df: pd.DataFrame,
+    customer_col: str = "CustomerId",
+    date_col: str = "TransactionStartTime",
+    amount_col: str = "Amount",
+    snapshot_date: str = None,
+) -> pd.DataFrame:
+    """
+    Compute Recency, Frequency, and Monetary (RFM) values per customer.
+
+    Args:
+        df:            Raw transaction DataFrame
+        customer_col:  Column identifying the customer
+        date_col:      Column with transaction timestamps
+        amount_col:    Column with transaction amounts
+        snapshot_date: Reference date for recency calculation.
+                       Defaults to one day after the last transaction.
+
+    Returns:
+        DataFrame with columns [customer_col, Recency, Frequency, Monetary]
+    """
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], utc=True)
+
+    if snapshot_date is None:
+        snapshot = df[date_col].max() + pd.Timedelta(days=1)
+    else:
+        snapshot = pd.Timestamp(snapshot_date, tz="UTC")
+
+    logger.info(f"RFM snapshot date: {snapshot}")
+
+    # Use only positive amounts (debits) for monetary value
+    debits = df[df[amount_col] > 0]
+
+    rfm = (
+        df.groupby(customer_col)
+        .agg(
+            Recency=(date_col, lambda x: (snapshot - x.max()).days),
+            Frequency=(date_col, "count"),
+        )
+        .reset_index()
+    )
+
+    monetary = (
+        debits.groupby(customer_col)[amount_col]
+        .sum()
+        .reset_index()
+        .rename(columns={amount_col: "Monetary"})
+    )
+
+    rfm = rfm.merge(monetary, on=customer_col, how="left")
+    rfm["Monetary"] = rfm["Monetary"].fillna(0)
+
+    logger.info(f"RFM computed for {len(rfm):,} customers.")
+    return rfm
+
+
+# ---------------------------------------------------------------------------
+# Risk Label Assignment via K-Means (Task 4)
+# ---------------------------------------------------------------------------
+
+def assign_risk_labels(
+    rfm: pd.DataFrame,
+    n_clusters: int = 3,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Segment customers into n_clusters using K-Means on scaled RFM features,
+    then label the high-risk cluster as is_high_risk = 1.
+
+    The high-risk cluster is identified as the one with:
+      - Highest Recency   (least recent)
+      - Lowest Frequency  (fewest transactions)
+      - Lowest Monetary   (lowest spend)
+
+    Args:
+        rfm:          DataFrame with Recency, Frequency, Monetary columns
+        n_clusters:   Number of K-Means clusters (default 3)
+        random_state: Random seed for reproducibility
+
+    Returns:
+        rfm DataFrame with cluster and is_high_risk columns added
+    """
+    rfm = rfm.copy()
+
+    # Scale RFM features before clustering
+    scaler = StandardScaler()
+    rfm_features = ["Recency", "Frequency", "Monetary"]
+    rfm_scaled = scaler.fit_transform(rfm[rfm_features])
+
+    # Fit K-Means
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    rfm["cluster"] = kmeans.fit_predict(rfm_scaled)
+
+    # Identify high-risk cluster: highest recency, lowest frequency & monetary
+    cluster_summary = rfm.groupby("cluster")[rfm_features].mean()
+    logger.info(f"Cluster summary:\n{cluster_summary}")
+
+    # Score each cluster: high recency = bad, low frequency = bad, low monetary = bad
+    # Normalize each dimension to [0,1] then compute risk score
+    norm = (cluster_summary - cluster_summary.min()) / (
+        cluster_summary.max() - cluster_summary.min() + 1e-9
+    )
+    # High risk = high recency + low frequency + low monetary
+    risk_score = norm["Recency"] - norm["Frequency"] - norm["Monetary"]
+    high_risk_cluster = int(risk_score.idxmax())
+
+    logger.info(f"High-risk cluster identified: {high_risk_cluster}")
+    logger.info(f"Risk scores per cluster:\n{risk_score}")
+
+    rfm["is_high_risk"] = (rfm["cluster"] == high_risk_cluster).astype(int)
+
+    n_high = rfm["is_high_risk"].sum()
+    logger.info(
+        f"High-risk customers: {n_high:,} ({n_high / len(rfm):.1%})"
+    )
+
+    return rfm
+
+
+# ---------------------------------------------------------------------------
 # Full Processing Entry Point
 # ---------------------------------------------------------------------------
 
-def process_raw_data(input_path: str, output_path: str = None) -> pd.DataFrame:
+def process_raw_data(
+    input_path: str,
+    output_path: str = None,
+) -> pd.DataFrame:
     """
-    Load raw data, apply the feature engineering pipeline, and optionally
-    save the processed DataFrame to a parquet file.
+    Load raw data, apply the feature engineering pipeline, compute RFM,
+    assign risk labels, and merge is_high_risk into the processed dataset.
+
+    Args:
+        input_path:  Path to raw data CSV
+        output_path: Optional path to save processed data as parquet
+
+    Returns:
+        Processed DataFrame with is_high_risk target column
     """
     df = load_data(input_path)
+
+    # Step 1: Compute RFM and assign risk labels (before dropping CustomerId)
+    rfm = compute_rfm(df)
+    rfm = assign_risk_labels(rfm)
+    risk_map = rfm.set_index("CustomerId")["is_high_risk"].to_dict()
+
+    # Step 2: Apply feature engineering pipeline
     pipeline = build_feature_pipeline()
     df_processed = pipeline.fit_transform(df)
+
+    # Step 3: Re-attach CustomerId temporarily to merge risk labels
+    df_processed["CustomerId"] = df["CustomerId"].values
+    df_processed["is_high_risk"] = df_processed["CustomerId"].map(risk_map)
+    df_processed = df_processed.drop(columns=["CustomerId"])
+
     logger.info(f"Processed shape: {df_processed.shape}")
+    logger.info(
+        f"is_high_risk distribution:\n"
+        f"{df_processed['is_high_risk'].value_counts(normalize=True)}"
+    )
+
     if output_path:
         df_processed.to_parquet(output_path, index=False)
         logger.info(f"Saved processed data to {output_path}")
+
     return df_processed
 
 
