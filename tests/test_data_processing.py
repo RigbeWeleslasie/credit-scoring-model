@@ -6,7 +6,6 @@ Unit tests for helper functions and transformers in src/data_processing.py.
 
 import pandas as pd
 import numpy as np
-import pytest
 from src.data_processing import (
     load_data,
     TemporalFeatureExtractor,
@@ -46,10 +45,6 @@ def make_sample_df():
     })
 
 
-# ---------------------------------------------------------------------------
-# load_data tests
-# ---------------------------------------------------------------------------
-
 class TestLoadData:
     def test_returns_dataframe(self, tmp_path):
         sample = make_sample_df()
@@ -72,10 +67,6 @@ class TestLoadData:
         result = load_data(str(path))
         assert len(result) == len(sample)
 
-
-# ---------------------------------------------------------------------------
-# TemporalFeatureExtractor tests
-# ---------------------------------------------------------------------------
 
 class TestTemporalFeatureExtractor:
     def test_creates_temporal_columns(self):
@@ -104,10 +95,6 @@ class TestTemporalFeatureExtractor:
         assert result["txn_month"].between(1, 12).all()
 
 
-# ---------------------------------------------------------------------------
-# AggregateFeatureBuilder tests
-# ---------------------------------------------------------------------------
-
 class TestAggregateFeatureBuilder:
     def test_creates_aggregate_columns(self):
         df = make_sample_df()
@@ -132,10 +119,6 @@ class TestAggregateFeatureBuilder:
         assert result["std_transaction_amount"].isnull().sum() == 0
 
 
-# ---------------------------------------------------------------------------
-# DropIdentifierColumns tests
-# ---------------------------------------------------------------------------
-
 class TestDropIdentifierColumns:
     def test_drops_expected_columns(self):
         df = make_sample_df()
@@ -153,10 +136,6 @@ class TestDropIdentifierColumns:
             assert col in result.columns
 
 
-# ---------------------------------------------------------------------------
-# LogTransformer tests
-# ---------------------------------------------------------------------------
-
 class TestLogTransformer:
     def test_transforms_value_column(self):
         df = make_sample_df()
@@ -172,10 +151,6 @@ class TestLogTransformer:
         assert (result["Value"] >= 0).all()
 
 
-# ---------------------------------------------------------------------------
-# Column selector tests
-# ---------------------------------------------------------------------------
-
 class TestColumnSelectors:
     def test_get_categorical_cols(self):
         df = pd.DataFrame({"a": ["x", "y"], "b": [1, 2]})
@@ -185,10 +160,6 @@ class TestColumnSelectors:
         df = pd.DataFrame({"a": ["x", "y"], "b": [1, 2]})
         assert get_numerical_cols(df) == ["b"]
 
-
-# ---------------------------------------------------------------------------
-# Full pipeline smoke test
-# ---------------------------------------------------------------------------
 
 class TestBuildFeaturePipeline:
     def test_pipeline_runs_without_error(self):
@@ -210,4 +181,3 @@ class TestBuildFeaturePipeline:
         result = pipeline.fit_transform(df)
         assert "transaction_count" in result.columns
         assert "avg_transaction_amount" in result.columns
-

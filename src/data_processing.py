@@ -64,19 +64,16 @@ class TemporalFeatureExtractor(BaseEstimator, TransformerMixin):
 
 class AggregateFeatureBuilder(BaseEstimator, TransformerMixin):
     """
-    Builds per-customer aggregate features:
-    - total_transaction_amount
-    - avg_transaction_amount
-    - transaction_count
-    - std_transaction_amount
-    - total_value
-    - avg_value
-    Then merges them back onto the transaction-level DataFrame.
+    Builds per-customer aggregate features and merges them back
+    onto the transaction-level DataFrame.
     """
 
-    def __init__(self, customer_col: str = "CustomerId",
-                 amount_col: str = "Amount",
-                 value_col: str = "Value"):
+    def __init__(
+        self,
+        customer_col: str = "CustomerId",
+        amount_col: str = "Amount",
+        value_col: str = "Value",
+    ):
         self.customer_col = customer_col
         self.amount_col = amount_col
         self.value_col = value_col
@@ -139,8 +136,13 @@ class LogTransformer(BaseEstimator, TransformerMixin):
     """
 
     def __init__(self, cols: list = None):
-        self.cols = cols or ["Value", "total_value", "avg_value",
-                             "total_transaction_amount", "avg_transaction_amount"]
+        self.cols = cols or [
+            "Value",
+            "total_value",
+            "avg_value",
+            "total_transaction_amount",
+            "avg_transaction_amount",
+        ]
 
     def fit(self, X, y=None):
         return self
@@ -155,19 +157,13 @@ class LogTransformer(BaseEstimator, TransformerMixin):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline Builder
+# Pipeline Builders
 # ---------------------------------------------------------------------------
 
 def build_feature_pipeline() -> Pipeline:
     """
     Build and return a sklearn Pipeline that transforms raw transaction
     data into a model-ready DataFrame.
-
-    Steps:
-      1. Extract temporal features from TransactionStartTime
-      2. Build per-customer aggregate features
-      3. Drop identifier columns
-      4. Apply log1p to skewed columns
     """
     pipeline = Pipeline(steps=[
         ("temporal", TemporalFeatureExtractor()),
@@ -178,19 +174,13 @@ def build_feature_pipeline() -> Pipeline:
     return pipeline
 
 
-def build_preprocessing_pipeline(categorical_cols: list,
-                 numerical_cols: list) -> ColumnTransformer:
+def build_preprocessing_pipeline(
+    categorical_cols: list,
+    numerical_cols: list,
+) -> ColumnTransformer:
     """
-    Build a ColumnTransformer that:
-    - Imputes and scales numerical features
-    - Imputes and one-hot encodes categorical features
-
-    Args:
-        categorical_cols: list of categorical column names
-        numerical_cols:   list of numerical column names
-
-    Returns:
-        A fitted-ready ColumnTransformer
+    Build a ColumnTransformer that imputes and scales numerical features
+    and imputes and one-hot encodes categorical features.
     """
     numerical_pipeline = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
@@ -218,25 +208,14 @@ def process_raw_data(input_path: str, output_path: str = None) -> pd.DataFrame:
     """
     Load raw data, apply the feature engineering pipeline, and optionally
     save the processed DataFrame to a parquet file.
-
-    Args:
-        input_path:  Path to raw data CSV
-        output_path: Optional path to save processed data as parquet
-
-    Returns:
-        Processed DataFrame (transaction-level with engineered features)
     """
     df = load_data(input_path)
-
     pipeline = build_feature_pipeline()
     df_processed = pipeline.fit_transform(df)
-
     logger.info(f"Processed shape: {df_processed.shape}")
-
     if output_path:
         df_processed.to_parquet(output_path, index=False)
         logger.info(f"Saved processed data to {output_path}")
-
     return df_processed
 
 
