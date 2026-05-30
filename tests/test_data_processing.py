@@ -1,7 +1,11 @@
 """
+test_data_processing.py
 -----------------------
 Unit tests for helper functions in src/data_processing.py.
 """
+
+import pandas as pd
+from src.data_processing import load_data
 
 import pytest
 import pandas as pd
