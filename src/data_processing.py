@@ -179,7 +179,7 @@ def build_feature_pipeline() -> Pipeline:
 
 
 def build_preprocessing_pipeline(categorical_cols: list,
-                                  numerical_cols: list) -> ColumnTransformer:
+                 numerical_cols: list) -> ColumnTransformer:
     """
     Build a ColumnTransformer that:
     - Imputes and scales numerical features
@@ -264,4 +264,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     process_raw_data(args.input, args.output)
-
