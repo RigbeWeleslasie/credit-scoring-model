@@ -7,10 +7,6 @@ Unit tests for helper functions in src/data_processing.py.
 import pandas as pd
 from src.data_processing import load_data
 
-import pytest
-import pandas as pd
-from src.data_processing import load_data
-
 
 def make_sample_df():
     """Create a minimal transaction DataFrame for testing."""
