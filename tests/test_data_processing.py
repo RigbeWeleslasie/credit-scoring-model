@@ -15,11 +15,15 @@ from src.data_processing import (
     AggregateFeatureBuilder,
     DropIdentifierColumns,
     LogTransformer,
+    WoEEncoder,
     get_categorical_cols,
     get_numerical_cols,
     build_feature_pipeline,
+    build_woe_pipeline,
     compute_rfm,
     assign_risk_labels,
+    get_risk_decision,
+    RISK_PROFILES,
 )
 from src.train import (
     evaluate_model,
@@ -29,6 +33,10 @@ from src.train import (
 )
 from src.predict import predict_single
 
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 def make_sample_df():
     """Minimal transaction DataFrame for testing."""
@@ -91,6 +99,25 @@ def make_model_ready_df():
     })
 
 
+def make_woe_df():
+    """DataFrame suitable for WoE encoding tests."""
+    np.random.seed(42)
+    n = 100
+    return pd.DataFrame({
+        "ProductCategory": np.random.choice(
+            ["airtime", "financial_services", "utility_bill"], n),
+        "ChannelId": np.random.choice(
+            ["ChannelId_1", "ChannelId_2", "ChannelId_3"], n),
+        "ProviderId": np.random.choice(["P1", "P2", "P3"], n),
+        "PricingStrategy": np.random.choice(["0", "2", "4"], n),
+        "is_high_risk": np.random.randint(0, 2, n),
+    })
+
+
+# ---------------------------------------------------------------------------
+# load_data tests
+# ---------------------------------------------------------------------------
+
 class TestLoadData:
     def test_returns_dataframe(self, tmp_path):
         sample = make_sample_df()
@@ -113,6 +140,14 @@ class TestLoadData:
         result = load_data(str(path))
         assert len(result) == len(sample)
 
+    def test_raises_if_file_missing(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_data(str(tmp_path / "nonexistent.csv"))
+
+
+# ---------------------------------------------------------------------------
+# TemporalFeatureExtractor tests
+# ---------------------------------------------------------------------------
 
 class TestTemporalFeatureExtractor:
     def test_creates_temporal_columns(self):
@@ -137,6 +172,10 @@ class TestTemporalFeatureExtractor:
         assert result["txn_month"].between(1, 12).all()
 
 
+# ---------------------------------------------------------------------------
+# AggregateFeatureBuilder tests
+# ---------------------------------------------------------------------------
+
 class TestAggregateFeatureBuilder:
     def test_creates_aggregate_columns(self):
         df = make_sample_df()
@@ -157,6 +196,10 @@ class TestAggregateFeatureBuilder:
         assert result["std_transaction_amount"].isnull().sum() == 0
 
 
+# ---------------------------------------------------------------------------
+# DropIdentifierColumns tests
+# ---------------------------------------------------------------------------
+
 class TestDropIdentifierColumns:
     def test_drops_expected_columns(self):
         df = make_sample_df()
@@ -171,6 +214,10 @@ class TestDropIdentifierColumns:
             assert col in result.columns
 
 
+# ---------------------------------------------------------------------------
+# LogTransformer tests
+# ---------------------------------------------------------------------------
+
 class TestLogTransformer:
     def test_transforms_value_column(self):
         df = make_sample_df()
@@ -184,6 +231,131 @@ class TestLogTransformer:
         assert (result["Value"] >= 0).all()
 
 
+# ---------------------------------------------------------------------------
+# WoEEncoder tests
+# ---------------------------------------------------------------------------
+
+class TestWoEEncoder:
+    def test_creates_woe_columns(self):
+        df = make_woe_df()
+        y = df["is_high_risk"]
+        encoder = WoEEncoder(cat_cols=["ProductCategory", "ChannelId"])
+        result = encoder.fit_transform(df, y)
+        assert "ProductCategory_woe" in result.columns
+        assert "ChannelId_woe" in result.columns
+
+    def test_drops_original_categorical_columns(self):
+        df = make_woe_df()
+        y = df["is_high_risk"]
+        encoder = WoEEncoder(cat_cols=["ProductCategory"])
+        result = encoder.fit_transform(df, y)
+        assert "ProductCategory" not in result.columns
+
+    def test_woe_values_are_finite(self):
+        df = make_woe_df()
+        y = df["is_high_risk"]
+        encoder = WoEEncoder(cat_cols=["ProductCategory"])
+        result = encoder.fit_transform(df, y)
+        assert result["ProductCategory_woe"].apply(np.isfinite).all()
+
+    def test_iv_scores_computed(self):
+        df = make_woe_df()
+        y = df["is_high_risk"]
+        encoder = WoEEncoder(cat_cols=["ProductCategory", "ChannelId"])
+        encoder.fit(df, y)
+        assert "ProductCategory" in encoder.iv_scores_
+        assert "ChannelId" in encoder.iv_scores_
+
+    def test_iv_report_returns_dataframe(self):
+        df = make_woe_df()
+        y = df["is_high_risk"]
+        encoder = WoEEncoder(cat_cols=["ProductCategory"])
+        encoder.fit(df, y)
+        report = encoder.get_iv_report()
+        assert isinstance(report, pd.DataFrame)
+        assert "feature" in report.columns
+        assert "iv" in report.columns
+        assert "strength" in report.columns
+
+    def test_unknown_categories_get_zero_woe(self):
+        df_train = make_woe_df()
+        y = df_train["is_high_risk"]
+        encoder = WoEEncoder(cat_cols=["ProductCategory"])
+        encoder.fit(df_train, y)
+        df_test = df_train.copy()
+        df_test["ProductCategory"] = "unknown_category"
+        result = encoder.transform(df_test)
+        assert (result["ProductCategory_woe"] == 0.0).all()
+
+    def test_woe_pipeline_builds(self):
+        pipeline = build_woe_pipeline()
+        assert "woe" in pipeline.named_steps
+        assert "imputer" in pipeline.named_steps
+        assert "scaler" in pipeline.named_steps
+
+
+# ---------------------------------------------------------------------------
+# Risk threshold tests
+# ---------------------------------------------------------------------------
+
+class TestGetRiskDecision:
+    def test_low_risk_moderate_profile(self):
+        result = get_risk_decision(0.10, "moderate")
+        assert result["risk_band"] == "low"
+        assert result["decision"] == "approve"
+        assert result["loan_duration_days"] == 90
+        assert result["credit_limit_pct"] == 1.0
+
+    def test_high_risk_moderate_profile(self):
+        result = get_risk_decision(0.75, "moderate")
+        assert result["risk_band"] == "high"
+        assert result["decision"] == "reduced_offer"
+        assert result["loan_duration_days"] == 14
+
+    def test_decline_moderate_profile(self):
+        result = get_risk_decision(0.90, "moderate")
+        assert result["risk_band"] == "decline"
+        assert result["decision"] == "decline"
+        assert result["loan_duration_days"] == 0
+        assert result["credit_limit_pct"] == 0.0
+
+    def test_conservative_stricter_than_moderate(self):
+        # Same probability should result in worse band under conservative profile
+        p = 0.25
+        moderate = get_risk_decision(p, "moderate")
+        conservative = get_risk_decision(p, "conservative")
+        moderate_bands = ["low", "medium", "high", "decline"]
+        assert moderate_bands.index(conservative["risk_band"]) >= \
+               moderate_bands.index(moderate["risk_band"])
+
+    def test_aggressive_more_lenient_than_moderate(self):
+        p = 0.75
+        moderate = get_risk_decision(p, "moderate")
+        aggressive = get_risk_decision(p, "aggressive")
+        moderate_bands = ["low", "medium", "high", "decline"]
+        assert moderate_bands.index(aggressive["risk_band"]) <= \
+               moderate_bands.index(moderate["risk_band"])
+
+    def test_all_profiles_defined(self):
+        for profile in ["conservative", "moderate", "aggressive"]:
+            assert profile in RISK_PROFILES
+            result = get_risk_decision(0.5, profile)
+            assert "risk_band" in result
+            assert "loan_duration_days" in result
+
+    def test_invalid_profile_raises(self):
+        with pytest.raises(ValueError, match="Unknown profile"):
+            get_risk_decision(0.5, "nonexistent")
+
+    def test_profile_used_in_response(self):
+        result = get_risk_decision(0.5, "conservative")
+        assert result["profile_used"] == "conservative"
+
+
+# ---------------------------------------------------------------------------
+# Column selector tests
+# ---------------------------------------------------------------------------
+
 class TestColumnSelectors:
     def test_get_categorical_cols(self):
         df = pd.DataFrame({"a": ["x", "y"], "b": [1, 2]})
@@ -193,6 +365,10 @@ class TestColumnSelectors:
         df = pd.DataFrame({"a": ["x", "y"], "b": [1, 2]})
         assert get_numerical_cols(df) == ["b"]
 
+
+# ---------------------------------------------------------------------------
+# Full pipeline smoke test
+# ---------------------------------------------------------------------------
 
 class TestBuildFeaturePipeline:
     def test_pipeline_runs_without_error(self):
@@ -212,6 +388,10 @@ class TestBuildFeaturePipeline:
         assert "transaction_count" in result.columns
         assert "avg_transaction_amount" in result.columns
 
+
+# ---------------------------------------------------------------------------
+# compute_rfm tests
+# ---------------------------------------------------------------------------
 
 class TestComputeRFM:
     def test_returns_dataframe(self):
@@ -240,6 +420,10 @@ class TestComputeRFM:
         assert result["Recency"].min() > 0
 
 
+# ---------------------------------------------------------------------------
+# assign_risk_labels tests
+# ---------------------------------------------------------------------------
+
 class TestAssignRiskLabels:
     def test_adds_is_high_risk_column(self):
         assert "is_high_risk" in assign_risk_labels(make_rfm_df()).columns
@@ -264,6 +448,10 @@ class TestAssignRiskLabels:
             r1.reset_index(drop=True), r2.reset_index(drop=True)
         )
 
+
+# ---------------------------------------------------------------------------
+# train.py tests
+# ---------------------------------------------------------------------------
 
 class TestLoadProcessedData:
     def test_raises_if_file_missing(self, tmp_path):
@@ -335,6 +523,10 @@ class TestBuildPipelines:
         assert len(preds) == len(y)
         assert set(preds).issubset({0, 1})
 
+
+# ---------------------------------------------------------------------------
+# predict.py tests
+# ---------------------------------------------------------------------------
 
 class TestPredictSingle:
     def test_raises_on_empty_features(self):

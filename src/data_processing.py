@@ -3,14 +3,18 @@ data_processing.py
 ------------------
 Feature engineering pipeline: transforms raw Xente transaction data
 into a model-ready dataset, including aggregate features, temporal
-feature extraction, encoding, scaling, and missing value handling.
+feature extraction, WoE/IV encoding, scaling, and missing value handling.
 
-Task 3 & Task 4 implementation.
+Also implements RFM-based proxy target variable construction with
+configurable risk thresholds for different portfolio risk appetites.
+
+Task 3, 4, and 7 implementation.
 """
 
 import logging
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -23,11 +27,144 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Risk Threshold Configuration
+# ---------------------------------------------------------------------------
+
+# Parameterized risk thresholds for different portfolio risk appetites.
+# These map risk_probability output to loan origination decisions.
+# Adjust RISK_PROFILE to change the bank's risk tolerance.
+#
+# Conservative: tighter thresholds, fewer approvals, lower default exposure
+# Moderate:     balanced approach, standard BNPL product
+# Aggressive:   broader approvals, higher volume, higher default tolerance
+#
+# Each profile defines:
+#   low_risk_threshold:    p below this → full credit, long duration
+#   medium_risk_threshold: p below this → reduced credit, standard duration
+#   high_risk_threshold:   p below this → minimal credit, short duration
+#   decline_threshold:     p above this → decline
+#   credit_limits:         dict of multipliers for requested amount
+#   loan_durations_days:   dict of loan durations per risk band
+
+RISK_PROFILES = {
+    "conservative": {
+        "description": "Tight thresholds for a new BNPL product with limited loss tolerance",
+        "low_risk_threshold":    0.20,
+        "medium_risk_threshold": 0.40,
+        "high_risk_threshold":   0.60,
+        "decline_threshold":     0.60,
+        "credit_limits": {
+            "low":    1.00,
+            "medium": 0.50,
+            "high":   0.20,
+            "decline": 0.00,
+        },
+        "loan_durations_days": {
+            "low":    60,
+            "medium": 21,
+            "high":   7,
+            "decline": 0,
+        },
+    },
+    "moderate": {
+        "description": "Balanced thresholds for a mature BNPL product",
+        "low_risk_threshold":    0.30,
+        "medium_risk_threshold": 0.60,
+        "high_risk_threshold":   0.80,
+        "decline_threshold":     0.80,
+        "credit_limits": {
+            "low":    1.00,
+            "medium": 0.75,
+            "high":   0.25,
+            "decline": 0.00,
+        },
+        "loan_durations_days": {
+            "low":    90,
+            "medium": 30,
+            "high":   14,
+            "decline": 0,
+        },
+    },
+    "aggressive": {
+        "description": "Broad approvals for maximum market penetration",
+        "low_risk_threshold":    0.40,
+        "medium_risk_threshold": 0.70,
+        "high_risk_threshold":   0.90,
+        "decline_threshold":     0.90,
+        "credit_limits": {
+            "low":    1.00,
+            "medium": 0.80,
+            "high":   0.50,
+            "decline": 0.00,
+        },
+        "loan_durations_days": {
+            "low":    90,
+            "medium": 45,
+            "high":   21,
+            "decline": 0,
+        },
+    },
+}
+
+# Default profile used at inference time
+DEFAULT_RISK_PROFILE = "moderate"
+
+
+def get_risk_decision(
+    risk_probability: float,
+    profile_name: str = DEFAULT_RISK_PROFILE,
+) -> dict:
+    """
+    Translate a risk probability into a loan origination decision.
+
+    Args:
+        risk_probability: Float between 0 and 1 from the model
+        profile_name:     One of 'conservative', 'moderate', 'aggressive'
+
+    Returns:
+        dict with keys: risk_band, credit_limit_pct, loan_duration_days,
+                        decision, profile_used
+    """
+    if profile_name not in RISK_PROFILES:
+        raise ValueError(
+            f"Unknown profile '{profile_name}'. "
+            f"Choose from: {list(RISK_PROFILES.keys())}"
+        )
+
+    profile = RISK_PROFILES[profile_name]
+    p = risk_probability
+
+    if p < profile["low_risk_threshold"]:
+        band = "low"
+        decision = "approve"
+    elif p < profile["medium_risk_threshold"]:
+        band = "medium"
+        decision = "approve_with_conditions"
+    elif p < profile["high_risk_threshold"]:
+        band = "high"
+        decision = "reduced_offer"
+    else:
+        band = "decline"
+        decision = "decline"
+
+    return {
+        "risk_band":          band,
+        "credit_limit_pct":   profile["credit_limits"][band],
+        "loan_duration_days": profile["loan_durations_days"][band],
+        "decision":           decision,
+        "profile_used":       profile_name,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Data Loading
 # ---------------------------------------------------------------------------
 
 def load_data(path: str) -> pd.DataFrame:
     """Load raw transaction data from CSV."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
     logger.info(f"Loading data from {path}")
     df = pd.read_csv(path)
     logger.info(f"Loaded {len(df):,} rows x {df.shape[1]} columns")
@@ -67,6 +204,14 @@ class AggregateFeatureBuilder(BaseEstimator, TransformerMixin):
     """
     Builds per-customer aggregate features and merges them back
     onto the transaction-level DataFrame.
+
+    Aggregate features computed:
+    - total_transaction_amount: sum of all transaction amounts per customer
+    - avg_transaction_amount:   mean transaction amount per customer
+    - transaction_count:        number of transactions per customer
+    - std_transaction_amount:   std dev of amounts (0 for single-tx customers)
+    - total_value:              sum of absolute transaction values
+    - avg_value:                mean absolute transaction value
     """
 
     def __init__(
@@ -134,6 +279,7 @@ class DropIdentifierColumns(BaseEstimator, TransformerMixin):
 class LogTransformer(BaseEstimator, TransformerMixin):
     """
     Applies log1p transformation to skewed numerical columns.
+    Clips values at 0 before transformation to handle negatives safely.
     """
 
     def __init__(self, cols: list = None):
@@ -157,6 +303,147 @@ class LogTransformer(BaseEstimator, TransformerMixin):
         return X
 
 
+class WoEEncoder(BaseEstimator, TransformerMixin):
+    """
+    Weight of Evidence (WoE) encoder for categorical features.
+
+    WoE transforms each category into:
+        WoE_i = ln(Distribution of Events_i / Distribution of Non-Events_i)
+
+    Where:
+        Distribution of Events_i    = Count of events in bin i / Total events
+        Distribution of Non-Events_i = Count of non-events in bin i / Total non-events
+
+    Business interpretation:
+        WoE > 0: category associated with lower risk (more non-events)
+        WoE < 0: category associated with higher risk (more events)
+        WoE = 0: category has no discriminatory power
+
+    Information Value (IV) measures the total predictive power of a feature:
+        IV = sum[(Dist_Events - Dist_NonEvents) * WoE]
+
+    IV interpretation (standard credit scoring guidelines):
+        IV < 0.02:  Useless predictor
+        IV 0.02-0.1: Weak predictor
+        IV 0.1-0.3:  Medium predictor
+        IV 0.3-0.5:  Strong predictor
+        IV > 0.5:    Suspicious (possible data leakage)
+
+    This implementation is used for the Logistic Regression path.
+    For XGBoost, one-hot encoding is used instead.
+    """
+
+    def __init__(
+        self,
+        cat_cols: list = None,
+        target_col: str = "is_high_risk",
+        min_samples: int = 5,
+        smoothing: float = 0.5,
+    ):
+        self.cat_cols = cat_cols or [
+            "ProductCategory",
+            "ChannelId",
+            "ProviderId",
+            "PricingStrategy",
+        ]
+        self.target_col = target_col
+        self.min_samples = min_samples
+        self.smoothing = smoothing
+        self.woe_maps_ = {}
+        self.iv_scores_ = {}
+
+    def fit(self, X, y=None):
+        """
+        Compute WoE and IV for each categorical column using the target variable.
+        """
+        if y is None and self.target_col in X.columns:
+            y = X[self.target_col]
+        elif y is None:
+            logger.warning("No target provided to WoEEncoder; skipping fit.")
+            return self
+
+        total_events = y.sum() + self.smoothing
+        total_nonevents = (1 - y).sum() + self.smoothing
+
+        for col in self.cat_cols:
+            if col not in X.columns:
+                continue
+
+            woe_map = {}
+            iv = 0.0
+
+            for cat in X[col].unique():
+                mask = X[col] == cat
+                n = mask.sum()
+                if n < self.min_samples:
+                    woe_map[cat] = 0.0
+                    continue
+
+                events = y[mask].sum() + self.smoothing
+                nonevents = (1 - y[mask]).sum() + self.smoothing
+
+                dist_events = events / total_events
+                dist_nonevents = nonevents / total_nonevents
+
+                woe = np.log(dist_events / dist_nonevents)
+                iv += (dist_events - dist_nonevents) * woe
+                woe_map[cat] = round(woe, 4)
+
+            self.woe_maps_[col] = woe_map
+            self.iv_scores_[col] = round(iv, 4)
+
+        logger.info("WoE encoding fitted.")
+        self._log_iv_summary()
+        return self
+
+    def transform(self, X):
+        """
+        Replace each categorical column with its WoE-encoded values.
+        Unknown categories get WoE = 0 (neutral).
+        """
+        X = X.copy()
+        for col in self.cat_cols:
+            if col not in X.columns or col not in self.woe_maps_:
+                continue
+            X[f"{col}_woe"] = X[col].map(self.woe_maps_[col]).fillna(0.0)
+            X = X.drop(columns=[col])
+        logger.info(f"WoE transformation applied to: {list(self.woe_maps_.keys())}")
+        return X
+
+    def _log_iv_summary(self):
+        """Log IV scores with business interpretation."""
+        logger.info("Information Value (IV) Summary:")
+        for col, iv in sorted(self.iv_scores_.items(), key=lambda x: -x[1]):
+            if iv < 0.02:
+                strength = "Useless"
+            elif iv < 0.1:
+                strength = "Weak"
+            elif iv < 0.3:
+                strength = "Medium"
+            elif iv < 0.5:
+                strength = "Strong"
+            else:
+                strength = "Suspicious (check for leakage)"
+            logger.info(f"  {col:25s}: IV={iv:.4f} ({strength})")
+
+    def get_iv_report(self) -> pd.DataFrame:
+        """Return a DataFrame summarizing IV scores for all encoded features."""
+        rows = []
+        for col, iv in self.iv_scores_.items():
+            if iv < 0.02:
+                strength = "Useless"
+            elif iv < 0.1:
+                strength = "Weak"
+            elif iv < 0.3:
+                strength = "Medium"
+            elif iv < 0.5:
+                strength = "Strong"
+            else:
+                strength = "Suspicious"
+            rows.append({"feature": col, "iv": iv, "strength": strength})
+        return pd.DataFrame(rows).sort_values("iv", ascending=False)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline Builders
 # ---------------------------------------------------------------------------
@@ -165,6 +452,12 @@ def build_feature_pipeline() -> Pipeline:
     """
     Build and return a sklearn Pipeline that transforms raw transaction
     data into a model-ready DataFrame.
+
+    Steps:
+      1. Extract temporal features from TransactionStartTime
+      2. Build per-customer aggregate features
+      3. Drop identifier columns
+      4. Apply log1p to skewed columns
     """
     pipeline = Pipeline(steps=[
         ("temporal", TemporalFeatureExtractor()),
@@ -180,8 +473,12 @@ def build_preprocessing_pipeline(
     numerical_cols: list,
 ) -> ColumnTransformer:
     """
-    Build a ColumnTransformer that imputes and scales numerical features
-    and imputes and one-hot encodes categorical features.
+    Build a ColumnTransformer for model-ready output:
+    - Numerical: median imputation + StandardScaler
+    - Categorical: most_frequent imputation + OneHotEncoder
+
+    Used for XGBoost path.
+    For Logistic Regression, use build_woe_pipeline() instead.
     """
     numerical_pipeline = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
@@ -199,6 +496,30 @@ def build_preprocessing_pipeline(
     ])
 
     return preprocessor
+
+
+def build_woe_pipeline(target_col: str = "is_high_risk") -> Pipeline:
+    """
+    Build a WoE-based pipeline for the Logistic Regression (scorecard) path.
+
+    Steps:
+      1. WoE encode categorical features (requires target at fit time)
+      2. Median imputation for remaining numerical features
+      3. StandardScaler normalization
+
+    WoE encoding business rationale:
+    - Transforms categories into log-odds of default, making coefficients
+      directly interpretable as credit risk contributions
+    - Monotonizes the relationship between each category and the target,
+      satisfying Basel II model documentation requirements
+    - IV scores guide feature selection (drop IV < 0.02)
+    """
+    pipeline = Pipeline(steps=[
+        ("woe", WoEEncoder(target_col=target_col)),
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+    return pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +557,6 @@ def compute_rfm(
 
     logger.info(f"RFM snapshot date: {snapshot}")
 
-    # Use only positive amounts (debits) for monetary value
     debits = df[df[amount_col] > 0]
 
     rfm = (
@@ -275,10 +595,15 @@ def assign_risk_labels(
     Segment customers into n_clusters using K-Means on scaled RFM features,
     then label the high-risk cluster as is_high_risk = 1.
 
-    The high-risk cluster is identified as the one with:
-      - Highest Recency   (least recent)
-      - Lowest Frequency  (fewest transactions)
-      - Lowest Monetary   (lowest spend)
+    The high-risk cluster is identified algorithmically as the one with the
+    highest risk score = normalized_recency - normalized_frequency - normalized_monetary.
+
+    Clustering notes:
+    - StandardScaler applied before K-Means to prevent Monetary (large range)
+      from dominating Recency and Frequency (smaller ranges)
+    - random_state=42 ensures reproducibility
+    - n_clusters=3 chosen to represent low/medium/high risk tiers
+      (validated against business intuition: disengaged / moderate / power users)
 
     Args:
         rfm:          DataFrame with Recency, Frequency, Monetary columns
@@ -290,25 +615,19 @@ def assign_risk_labels(
     """
     rfm = rfm.copy()
 
-    # Scale RFM features before clustering
     scaler = StandardScaler()
     rfm_features = ["Recency", "Frequency", "Monetary"]
     rfm_scaled = scaler.fit_transform(rfm[rfm_features])
 
-    # Fit K-Means
     kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
     rfm["cluster"] = kmeans.fit_predict(rfm_scaled)
 
-    # Identify high-risk cluster: highest recency, lowest frequency & monetary
     cluster_summary = rfm.groupby("cluster")[rfm_features].mean()
     logger.info(f"Cluster summary:\n{cluster_summary}")
 
-    # Score each cluster: high recency = bad, low frequency = bad, low monetary = bad
-    # Normalize each dimension to [0,1] then compute risk score
     norm = (cluster_summary - cluster_summary.min()) / (
         cluster_summary.max() - cluster_summary.min() + 1e-9
     )
-    # High risk = high recency + low frequency + low monetary
     risk_score = norm["Recency"] - norm["Frequency"] - norm["Monetary"]
     high_risk_cluster = int(risk_score.idxmax())
 
@@ -318,9 +637,14 @@ def assign_risk_labels(
     rfm["is_high_risk"] = (rfm["cluster"] == high_risk_cluster).astype(int)
 
     n_high = rfm["is_high_risk"].sum()
-    logger.info(
-        f"High-risk customers: {n_high:,} ({n_high / len(rfm):.1%})"
-    )
+    pct = n_high / len(rfm)
+    logger.info(f"High-risk customers: {n_high:,} ({pct:.1%})")
+
+    if pct < 0.10 or pct > 0.60:
+        logger.warning(
+            f"High-risk proportion ({pct:.1%}) is outside expected range [10%, 60%]. "
+            f"Consider adjusting n_clusters or reviewing the data window."
+        )
 
     return rfm
 
@@ -346,16 +670,13 @@ def process_raw_data(
     """
     df = load_data(input_path)
 
-    # Step 1: Compute RFM and assign risk labels (before dropping CustomerId)
     rfm = compute_rfm(df)
     rfm = assign_risk_labels(rfm)
     risk_map = rfm.set_index("CustomerId")["is_high_risk"].to_dict()
 
-    # Step 2: Apply feature engineering pipeline
     pipeline = build_feature_pipeline()
     df_processed = pipeline.fit_transform(df)
 
-    # Step 3: Re-attach CustomerId temporarily to merge risk labels
     df_processed["CustomerId"] = df["CustomerId"].values
     df_processed["is_high_risk"] = df_processed["CustomerId"].map(risk_map)
     df_processed = df_processed.drop(columns=["CustomerId"])
