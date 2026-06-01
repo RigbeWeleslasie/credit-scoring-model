@@ -2,31 +2,37 @@
 
 An end-to-end credit risk probability model built for Bati Bank's buy-now-pay-later partnership with an eCommerce platform. This project transforms raw transaction data into a deployed model service that scores new applicants in real time.
 
+![CI](https://github.com/RigbeWeleslasie/credit-scoring-model/actions/workflows/ci.yml/badge.svg)
+
 ---
 
 ## Project Structure
 
 ```
 credit-scoring-model/
-├── .github/workflows/ci.yml       # CI/CD pipeline
+├── .github/workflows/ci.yml       # CI/CD: flake8 + pytest + Docker build
 ├── data/
 │   ├── raw/                        # Raw data (gitignored)
-│   └── processed/                  # Processed data (gitignored)
+│   └── processed/                  # Processed parquet (gitignored)
+├── models/                         # Saved model artifacts (gitignored)
 ├── notebooks/
-│   └── eda.ipynb                   # Exploratory data analysis
+│   └── eda.ipynb                   # Exploratory data analysis (11 saved figures)
+├── reports/
+│   └── figures/                    # EDA plots (PNG)
 ├── src/
 │   ├── __init__.py
-│   ├── data_processing.py          # Feature engineering pipeline
-│   ├── train.py                    # Model training & MLflow tracking
+│   ├── data_processing.py          # Feature engineering pipeline + RFM + is_high_risk
+│   ├── train.py                    # Model training + MLflow tracking
 │   ├── predict.py                  # Inference utilities
 │   └── api/
 │       ├── main.py                 # FastAPI application
 │       └── pydantic_models.py      # Request/response schemas
 ├── tests/
-│   └── test_data_processing.py     # Unit tests
+│   └── test_data_processing.py     # 41 unit tests
 ├── Dockerfile
 ├── docker-compose.yml
-├── requirements.txt
+├── requirements.txt                # Full dependencies
+├── requirements-api.txt            # API-only dependencies (used in Docker)
 └── README.md
 ```
 
@@ -43,105 +49,188 @@ The Basel II Capital Accord requires banks to hold capital reserves proportional
 - **Model risk must be managed.** A poorly documented model that is later found to be flawed can trigger capital add-ons or regulatory sanctions. Full experiment tracking (e.g., via MLflow) and version-controlled code address this by creating a reproducible audit trail.
 - **Fair lending considerations.** Models must not produce discriminatory outcomes. Interpretable models (e.g., Logistic Regression with Weight of Evidence) make it easier to audit input features for proxy discrimination.
 
-In summary, Basel II pushes practitioners toward models where every parameter, feature, and transformation can be explained to a non-technical auditor — making interpretability a first-class engineering constraint.
-
 ---
 
 ### 2. Without a direct "default" label, why is a proxy variable necessary, and what business risks does proxy-based prediction introduce?
 
-The raw dataset contains transaction records but **no ground-truth label indicating whether a customer defaulted on a loan**. This is common when a lender is new to a market or when historical loan repayment data has not been collected. A proxy variable bridges this gap by using observable behavioral signals — in this case, RFM (Recency, Frequency, Monetary) patterns — to infer creditworthiness.
+The raw dataset contains transaction records but **no ground-truth label indicating whether a customer defaulted on a loan**. A proxy variable bridges this gap by using RFM (Recency, Frequency, Monetary) patterns to infer creditworthiness.
 
 **Why a proxy is necessary:**
 - Supervised machine learning requires a target label. Without one, no classification model can be trained.
-- RFM metrics are well-established in both marketing and credit risk literature as indicators of customer engagement and financial health. A customer who transacts frequently, recently, and with high monetary value is behaviorally similar to a low-risk borrower.
-- Clustering disengaged customers (low recency, low frequency, low monetary) as "high risk" provides a reasonable, defensible approximation of default propensity.
+- RFM metrics are well-established indicators of customer engagement and financial health.
+- Clustering disengaged customers as "high risk" provides a reasonable approximation of default propensity.
 
 **Business risks introduced by proxy-based prediction:**
 
 | Risk | Description |
 |---|---|
-| **Label noise** | The proxy is not ground truth. Some customers labeled "high risk" may be perfectly creditworthy, and vice versa. |
-| **Concept drift** | The relationship between RFM behavior and actual default may change over time, making the proxy unstable. |
-| **Regulatory exposure** | Basel II expects models to be validated against actual default outcomes. A proxy-based model may not satisfy back-testing requirements long-term. |
-| **Feedback loops** | Denying credit to customers labeled high-risk prevents them from demonstrating creditworthiness, reinforcing the label. |
-| **Selection bias** | The eCommerce platform's customer base may not represent the general credit-seeking population. |
+| **Label noise** | Some customers labeled "high risk" may be perfectly creditworthy |
+| **Concept drift** | The RFM-to-default relationship may change over time |
+| **Regulatory exposure** | Basel II expects back-testing against actual default outcomes |
+| **Feedback loops** | Denying credit reinforces the high-risk label |
+| **Selection bias** | eCommerce customers may not represent the general credit-seeking population |
 
-The proxy variable should be treated as a **modeling assumption**, not ground truth. As actual loan repayment data accumulates, the proxy should be replaced with real default labels and the model retrained.
+The proxy variable is a **modeling assumption**, not ground truth, and will be replaced with actual repayment data as it accumulates.
 
 ---
 
 ### 3. What are the key trade-offs between a simple, interpretable model and a high-performance model in a regulated financial context?
 
-| Dimension | Logistic Regression + WoE | Gradient Boosting (XGBoost / LightGBM) |
+| Dimension | Logistic Regression + WoE | XGBoost |
 |---|---|---|
-| **Interpretability** | High — coefficients map directly to log-odds; WoE bins are explainable to regulators | Low — hundreds of trees; no direct feature-level explanation without SHAP |
-| **Regulatory compliance** | Easier to document and defend under Basel II Pillar 2 | Requires additional explainability tooling (SHAP, LIME) to satisfy auditors |
-| **Predictive performance** | Moderate — assumes linear log-odds relationship | High — captures non-linear interactions and complex patterns |
-| **Feature engineering burden** | High — requires careful WoE binning, IV selection, monotonicity checks | Lower — tree models handle raw features, missing values, and skew natively |
-| **Overfitting risk** | Low — simpler model, fewer parameters | Higher — requires careful regularization and cross-validation |
-| **Scorecard conversion** | Straightforward — logistic regression maps cleanly to a points-based scorecard | Complex — non-linear outputs are harder to convert to a scorecard format |
-| **Maintenance** | Easier — fewer hyperparameters, stable behavior | Harder — more sensitive to data drift, requires more monitoring |
+| **Interpretability** | High — coefficients map to log-odds | Low — requires SHAP for explainability |
+| **Regulatory compliance** | Easier to defend under Basel II Pillar 2 | Needs additional explainability tooling |
+| **Predictive performance** | Moderate (ROC-AUC: 0.933) | High (ROC-AUC: 0.999) |
+| **Overfitting risk** | Low | Higher — requires regularization |
+| **Scorecard conversion** | Straightforward | Complex |
+| **Maintenance** | Easier | More sensitive to data drift |
 
-**Recommendation for this project:** Train both a Logistic Regression (with WoE) and a Gradient Boosting model. Use the Logistic Regression as the **primary production model** for Basel II compliance and interpretability, and the Gradient Boosting model as a **challenger model** to benchmark performance. If the performance gap is large, document the trade-off and consider using SHAP values to partially satisfy explainability requirements for the challenger.
+Both models were trained and tracked in MLflow. XGBoost was selected as the production model based on ROC-AUC. Logistic Regression serves as the interpretable challenger.
+
+---
+
+## Model Results
+
+| Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
+|---|---|---|---|---|---|
+| Logistic Regression | 0.828 | 0.390 | 0.891 | 0.543 | 0.933 |
+| **XGBoost** | **0.995** | **0.965** | **0.991** | **0.978** | **0.999** |
+
+**Top features (XGBoost):** `txn_month` (44.5%), `transaction_count` (18.2%), `total_value` (6.6%)
 
 ---
 
 ## EDA Findings
 
-The exploratory analysis of the Xente transaction dataset revealed the following key insights:
-
-1. **Skewed Transaction Amounts** — Both `Amount` and `Value` are heavily right-skewed with extreme outliers. Log transformation will be applied during feature engineering.
-
-2. **Fraud Label Imbalance** — The fraud rate is ~0.2%, making `FraudResult` unsuitable as a credit risk proxy. A separate target variable will be engineered using RFM segmentation.
-
-3. **Uneven Customer Engagement** — Transaction frequency per customer is highly skewed. A small group of highly active customers dominates, while most customers have very few transactions — the core signal for RFM-based risk labeling.
-
-4. **Temporal Patterns** — Clear intraday and intraweek transaction patterns exist. Hour of day and day of week will be extracted as features.
-
-5. **Predictive Categorical Features** — Fraud rates and transaction values vary significantly across product categories and channels, making them valuable features for the model.
+1. **Skewed Transaction Amounts** — Both `Amount` and `Value` are heavily right-skewed. Log1p transformation applied during feature engineering.
+2. **Fraud Label Imbalance** — Fraud rate ~0.2%. `FraudResult` cannot proxy credit risk. RFM-based proxy target engineered separately.
+3. **Uneven Customer Engagement** — Most customers transact rarely; a small group dominates volume — core signal for RFM clustering.
+4. **Temporal Patterns** — Clear intraday and intraweek patterns. `txn_hour` and `txn_day_of_week` extracted as features.
+5. **Predictive Categorical Features** — Fraud rates and transaction values vary across product categories and channels.
 
 Full analysis: [`notebooks/eda.ipynb`](notebooks/eda.ipynb)
+
+---
 
 ## Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/credit-scoring-model.git
+git clone https://github.com/RigbeWeleslasie/credit-scoring-model.git
 cd credit-scoring-model
-
-# Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 
 # Place raw data
 cp /path/to/data.csv data/raw/data.csv
+
+# Run feature engineering + RFM pipeline
+python3 -m src.data_processing \
+  --input data/raw/data.csv \
+  --output data/processed/data_processed.parquet
+
+# Train models
+python3 -m src.train \
+  --data data/processed/data_processed.parquet \
+  --experiment credit-risk \
+  --mlflow-uri sqlite:///mlflow.db
+
+# Save best model artifact
+mkdir -p models
+python3 -c "
+import mlflow, joblib
+mlflow.set_tracking_uri('sqlite:///mlflow.db')
+model = mlflow.sklearn.load_model('runs:/<run_id>/model')
+joblib.dump(model, 'models/xgboost_model.pkl')
+"
 ```
+
+---
 
 ## Running the API
 
 ```bash
-# With Docker
-docker-compose up --build
+# With Docker (recommended)
+docker build -t credit-risk-api .
+docker run -p 8000:8000 \
+  -e MODEL_URI="/app/models/xgboost_model.pkl" \
+  -v $(pwd)/models:/app/models \
+  credit-risk-api
 
 # Without Docker
 uvicorn src.api.main:app --reload
 ```
 
+### Sample Request
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer_id": "CustomerId_4406",
+    "Amount": 1000.0,
+    "Value": 1000.0,
+    "PricingStrategy": 2,
+    "FraudResult": 0,
+    "txn_hour": 14,
+    "txn_day": 15,
+    "txn_month": 11,
+    "txn_year": 2018,
+    "txn_day_of_week": 2,
+    "total_transaction_amount": 10.5,
+    "avg_transaction_amount": 8.2,
+    "transaction_count": 15,
+    "std_transaction_amount": 2.1,
+    "total_value": 10.5,
+    "avg_value": 8.2
+  }'
+```
+
+### Sample Response
+
+```json
+{
+  "customer_id": "CustomerId_4406",
+  "risk_probability": 0.868,
+  "risk_label": "high_risk"
+}
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/health` | GET | Service and model status |
+| `/predict` | POST | Credit risk score for a customer |
+| `/docs` | GET | Interactive Swagger UI |
+
+---
+
 ## Running Tests
 
 ```bash
-pytest tests/
+pytest tests/ -v
+# 41 tests passing
 ```
 
 ## MLflow UI
 
 ```bash
-mlflow ui
+mlflow ui --backend-store-uri sqlite:///mlflow.db
 # Open http://localhost:5000
 ```
+
+---
+
+## CI/CD
+
+Every push triggers:
+1. **flake8** — code style linting
+2. **pytest** — 41 unit tests
+3. **Notebook validation** — structure and cell checks
+4. **Required files check** — ensures all project files exist
+5. **Docker build** — validates the image builds successfully
 
 ---
 
